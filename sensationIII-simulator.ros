@@ -1,19 +1,22 @@
-;;; to use this project, put the following where quickload can find them:
-;;; git clone https://github.com/ivan4th/i4-diet-utils.git
-;;; git clone https://github.com/ivan4th/cl-mqtt.git
+#!/bin/sh
+#|-*- mode:lisp -*-|#
+#| Publish data from adjustable file pointer to MQTT broker at a configurable pace.
+exec ros -Q -- $0 "$@"
+|#
+(progn
+  (ros:ensure-asdf)
+  ;; local libs: https://github.com/ivan4th/i4-diet-utils.git
+  ;;             https://github.com/ivan4th/cl-mqtt.git
+  #+quicklisp (ql:quickload '(:cl-mqtt
+                              :cl-async
+                              :cl-ppcre
+                              :cl-json) :silent t))
 
-;;; To control the simulator, publish on the in topic, like
-;;; mosquitto_pub -t sensationIII/cmd -h test.mosquitto.org -m "{\"line\":2}"
-;;; This would reset the simulator to read from line 2 of the data file
+(defpackage :sensationIII-simulator
+  (:use :cl))
+(in-package :sensationIII-simulator)
 
-
-;;(in-package :sensationIII-simulator)
-;; TODO: write a defpackage and a defsystem that :uses and :depends-on these:
-(ql:quickload :cl-mqtt)
-(ql:quickload :cl-async)
-(ql:quickload :cl-ppcre)
-
-;; Util macros
+;; Util macros binding the symbol it
 (defmacro when-it (test &body then)
   (let ((it (intern (string 'it))))
     `(let ((,it ,test))
@@ -44,13 +47,14 @@
   (cl-json:encode-json-to-string (mapcar #'cons keys values)))
 
 (defun find-key (key json-string)
+  "Searches for a key in a json string. Returns (key . val) on success."
   (assoc key (cl-json:decode-json-from-string json-string)))
 
-(defun sensationIII-simulator (filename broker &key
-                                                 (delay-seconds 1)
-                                                 (port 1883)
-                                                 (topic-out "sensationIII/toungedata")
-                                                 (topic-in "sensationIII/cmd"))
+(defun main (filename broker &key
+                             (delay-seconds 1)
+                             (port 1883)
+                             (topic-out "sensationIII/toungedata")
+                             (topic-in "sensationIII/cmd"))
   "Publish data from adjustable file pointer to MQTT broker at a configurable pace.
    File pointer and pace are controlled through topic-in via broker, using the keys
    * line (sets the line in the file you want to read from)
@@ -95,8 +99,15 @@
               (setf event nil))))))
 
     ;; Actual simulation starts here
-    (as:with-event-loop (:catch-app-errors t)
+    (as:with-event-loop (:catch-app-errors nil)
       (bb:alet ((keys (csv-string->list-of-strings (read-line file-stream nil)))
                 (mqtt-connection (mqtt:connect broker :port port :on-message #'handle-mqtt-cmd)))
         (mqtt:subscribe mqtt-connection topic-in)
-        (periodically-publish mqtt-connection keys)))))
+        (let ((periodic-event-lambda (periodically-publish mqtt-connection keys)))
+          (as:signal-handler as:+sigint+
+                             (lambda (sig)
+                               (declare (ignore sig))
+                               (format t "Closing mqtt connection...~%")
+                               (mqtt:disconnect mqtt-connection)
+                               (funcall periodic-event-lambda)
+                               (as:free-signal-handler as:+sigint+))))))))
