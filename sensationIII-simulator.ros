@@ -7,6 +7,11 @@ exec ros -Q -- $0 "$@"
   (ros:ensure-asdf)
   ;; local libs: https://github.com/ivan4th/i4-diet-utils.git
   ;;             https://github.com/ivan4th/cl-mqtt.git
+  ;; Note that printv.lisp has a swank line tha can cause problems when loading:
+  ;; cd ~/.roswell/lisp/quicklisp/dists/quicklisp/software/printv-20140714-git ; vim +248 printv.lisp
+  ;;
+  ;; You also need libuv for the async stuff to work...
+  ;; https://github.com/libuv/libuv.git
   #+quicklisp (ql:quickload '(:cl-mqtt
                               :cl-async
                               :cl-ppcre
@@ -44,70 +49,85 @@ exec ros -Q -- $0 "$@"
     (cons (first strings) (mapcar #'read-from-string (rest strings)))))
 
 (defun lists->json (keys values)
-  (cl-json:encode-json-to-string (mapcar #'cons keys values)))
+  (cl-json:encode-json-to-string (pairlis keys values)))
 
 (defun find-key (key json-string)
   "Searches for a key in a json string. Returns (key . val) on success."
   (assoc key (cl-json:decode-json-from-string json-string)))
 
-(defun main (filename broker &key
-                             (delay-seconds 1)
-                             (port 1883)
-                             (topic-out "sensationIII/toungedata")
-                             (topic-in "sensationIII/cmd"))
+(defun main (&optional filename broker &rest argv)
   "Publish data from adjustable file pointer to MQTT broker at a configurable pace.
    File pointer and pace are controlled through topic-in via broker, using the keys
    * line (sets the line in the file you want to read from)
    * position (sets byte position you want to read from, rounded up to the next newline)
    * delay-seconds (sets the seconds you want to pass between each send)
+
+   Usage:
+   ./sensationIII-simulator.ros <filename> <broker> [--delay-seconds <number>] [--port <port>] [--topic-in <topic>] [--topic-out <topic>]
    "
-  (format t "Starting MQTT connected sensor simulator~%")
-  (with-open-file (file-stream filename)
-    (defun pop-line ()
-      "Pop a line from the file, reset file pointer if necessary"
-      (if-it (read-line file-stream nil nil)
-             it
-             (progn (file-position file-stream 0)
-                    (read-line file-stream nil nil)
-                    (read-line file-stream nil nil))))
+  (unless (and filename broker)
+    (format t "Usage:~%./sensationIII-simulator.ros <filename> <broker> [--delay-seconds <number>] [--port <port>] [--topic-in <topic>] [--topic-out <topic>]~%")
+    (return-from main 0))
+  (let ((delay-seconds 1)
+        (port 1883)
+        (topic-out "sensationIII/toungedata")
+        (topic-in "sensationIII/cmd"))
+    (loop for option = (pop argv)
+          for value = (pop argv)
+          while option
+          do
+             (alexandria:switch (option :test #'string=)
+                    ("--delay-seconds" (setf delay-seconds (read-from-string value)))
+                    ("--port" (setf port (read-from-string value)))
+                    ("--topic-in" (setf topic-in value))
+                    ("--topic-out" (setf topic-out value))))
+    (format t "Starting MQTT connected sensor simulator~%")
+    (with-open-file (file-stream filename)
+      (defun pop-line ()
+        "Pop a line from the file, reset file pointer if necessary"
+        (if-it (read-line file-stream nil nil)
+               it
+               (progn (file-position file-stream 0)
+                      (read-line file-stream nil nil)
+                      (read-line file-stream nil nil))))
 
-    (defun handle-mqtt-cmd (message)
-      "Set delay between messages and file position according to received MQTT message."
-      (let ((decoded-message (mqtt-read message)))
-        (when-it (find-key :delay-seconds decoded-message)
-          (setf delay-seconds (cdr it)))
-        (when-it (find-key :position decoded-message)
-          (file-position file-stream (cdr it))
-          (pop-line))
-        (when-it (find-key :line decoded-message)
-          (file-position file-stream 0)
-          (dotimes (i (- (cdr it) 1))
-            (pop-line)))))
+      (defun handle-mqtt-cmd (message)
+        "Set delay between messages and file position according to received MQTT message."
+        (let ((decoded-message (mqtt-read message)))
+          (when-it (find-key :delay-seconds decoded-message)
+            (setf delay-seconds (cdr it)))
+          (when-it (find-key :position decoded-message)
+            (file-position file-stream (cdr it))
+            (pop-line))
+          (when-it (find-key :line decoded-message)
+            (file-position file-stream 0)
+            (dotimes (i (- (cdr it) 1))
+              (pop-line)))))
 
-    (defun periodically-publish (mqtt-connection keys)
-      "When called within an event loop publishes according to delay-seconds and file position."
-      (let (event)
-        (labels ((main ()
-                   (mqtt:publish mqtt-connection topic-out
-                                 (lists->json keys (csv-string->values (pop-line))))
-                   (when event
-                     (setf event (as:delay #'main :time delay-seconds)))))
-          (setf event (as:delay #'main :time delay-seconds))
-          (lambda ()
-            (when event
-              (as:remove-event event)
-              (setf event nil))))))
+      (defun periodically-publish (mqtt-connection keys)
+        "When called within an event loop publishes according to delay-seconds and file position."
+        (let (event)
+          (labels ((main ()
+                     (mqtt:publish mqtt-connection topic-out
+                                   (lists->json keys (csv-string->values (pop-line))))
+                     (when event
+                       (setf event (as:delay #'main :time delay-seconds)))))
+            (setf event (as:delay #'main :time delay-seconds))
+            (lambda ()
+              (when event
+                (as:remove-event event)
+                (setf event nil))))))
 
-    ;; Actual simulation starts here
-    (as:with-event-loop (:catch-app-errors nil)
-      (bb:alet ((keys (csv-string->list-of-strings (read-line file-stream nil)))
-                (mqtt-connection (mqtt:connect broker :port port :on-message #'handle-mqtt-cmd)))
-        (mqtt:subscribe mqtt-connection topic-in)
-        (let ((periodic-event-lambda (periodically-publish mqtt-connection keys)))
-          (as:signal-handler as:+sigint+
-                             (lambda (sig)
-                               (declare (ignore sig))
-                               (format t "Closing mqtt connection...~%")
-                               (mqtt:disconnect mqtt-connection)
-                               (funcall periodic-event-lambda)
-                               (as:free-signal-handler as:+sigint+))))))))
+      ;; Actual simulation starts here
+      (as:with-event-loop (:catch-app-errors nil)
+        (bb:alet ((keys (csv-string->list-of-strings (read-line file-stream nil)))
+                  (mqtt-connection (mqtt:connect broker :port port :on-message #'handle-mqtt-cmd)))
+          (mqtt:subscribe mqtt-connection topic-in)
+          (let ((periodic-event-lambda (periodically-publish mqtt-connection keys)))
+            (as:signal-handler as:+sigint+
+                               (lambda (sig)
+                                 (declare (ignore sig))
+                                 (format t "Closing mqtt connection...~%")
+                                 (mqtt:disconnect mqtt-connection)
+                                 (funcall periodic-event-lambda)
+                                 (as:free-signal-handler as:+sigint+)))))))))
