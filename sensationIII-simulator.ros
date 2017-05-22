@@ -6,7 +6,7 @@ exec ros -Q -- $0 "$@"
 (progn
   (ros:ensure-asdf)
   ;; local libs: https://github.com/ivan4th/i4-diet-utils.git
-  ;;             https://github.com/ivan4th/cl-mqtt.git
+  ;;             https://github.com/tobbelobb/cl-mqtt.git
   ;; Note that printv.lisp has a swank line tha can cause problems when loading:
   ;; cd ~/.roswell/lisp/quicklisp/dists/quicklisp/software/printv-20140714-git ; vim +248 printv.lisp
   ;;
