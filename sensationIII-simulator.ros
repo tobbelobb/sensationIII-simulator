@@ -44,7 +44,7 @@ exec ros -Q -- $0 "$@"
 
 (defun csv-string->values (string)
   "Keep the first value as it is, use lisp reader on the rest.
-   You must really trust that the strings don't contain malicious lisp code when you use this function..."
+   You must trust that the strings don't contain malicious lisp code when you use this function..."
   (let ((strings (csv-string->list-of-strings string)))
     (cons (first strings) (mapcar #'read-from-string (rest strings)))))
 
@@ -66,12 +66,14 @@ exec ros -Q -- $0 "$@"
    ./sensationIII-simulator.ros <filename> <broker> [--delay-seconds <number>] [--port <port>] [--topic-in <topic>] [--topic-out <topic>]
    "
   (unless (and filename broker)
-    (format t "Usage:~%./sensationIII-simulator.ros <filename> <broker> [--delay-seconds <number>] [--port <port>] [--topic-in <topic>] [--topic-out <topic>]~%")
+    (format t "Usage:~%./sensationIII-simulator.ros <filename> <broker> [--user <username>] [--password <password>] [--delay-seconds <number>] [--port <port>] [--topic-in <topic>] [--topic-out <topic>]~%")
     (return-from main 0))
-  (let ((delay-seconds 1)
+  (let ((delay-seconds 10)
         (port 1883)
+        (topic-in "sensationIII/cmd")
         (topic-out "sensationIII/toungedata")
-        (topic-in "sensationIII/cmd"))
+        (user "")
+        (password ""))
     (loop for option = (pop argv)
           for value = (pop argv)
           while option
@@ -80,7 +82,9 @@ exec ros -Q -- $0 "$@"
                     ("--delay-seconds" (setf delay-seconds (read-from-string value)))
                     ("--port" (setf port (read-from-string value)))
                     ("--topic-in" (setf topic-in value))
-                    ("--topic-out" (setf topic-out value))))
+                    ("--topic-out" (setf topic-out value))
+                    ("--user" (setf user value))
+                    ("--password" (setf password value))))
     (format t "Starting MQTT connected sensor simulator~%")
     (with-open-file (file-stream filename)
       (defun pop-line ()
@@ -108,6 +112,7 @@ exec ros -Q -- $0 "$@"
         "When called within an event loop publishes according to delay-seconds and file position."
         (let (event)
           (labels ((main ()
+                     ;; use mosquitto_pub here instead??
                      (mqtt:publish mqtt-connection topic-out
                                    (lists->json keys (csv-string->values (pop-line))))
                      (when event
@@ -121,7 +126,8 @@ exec ros -Q -- $0 "$@"
       ;; Actual simulation starts here
       (as:with-event-loop (:catch-app-errors nil)
         (bb:alet ((keys (csv-string->list-of-strings (read-line file-stream nil)))
-                  (mqtt-connection (mqtt:connect broker :port port :on-message #'handle-mqtt-cmd)))
+                  (mqtt-connection (mqtt:connect broker :port port :on-message #'handle-mqtt-cmd
+                                                        :user user :password password)))
           (mqtt:subscribe mqtt-connection topic-in)
           (let ((periodic-event-lambda (periodically-publish mqtt-connection keys)))
             (as:signal-handler as:+sigint+
